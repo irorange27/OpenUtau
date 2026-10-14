@@ -16,11 +16,16 @@ namespace OpenUtau.Core.DawIntegration {
         public const string GetAudio = "getAudio";
         public const string UpdateTracks = "updateTracks";
         public const string UpdateProjectInfo = "updateProjectInfo";
+        // OpenUtau -> plugin, v1.3 MIDI input (§6.3)
+        public const string RecordStart = "recordStart";
+        public const string RecordStop = "recordStop";
         // plugin -> OpenUtau
         public const string Ping = "ping";
         public const string PlaybackStarted = "playbackStarted";
         public const string Playhead = "playhead";
         public const string Bpm = "bpm";
+        // plugin -> OpenUtau, v1.3 MIDI input (§6.3)
+        public const string MidiNotes = "midiNotes";
     }
 
     /// <summary>
@@ -28,8 +33,8 @@ namespace OpenUtau.Core.DawIntegration {
     /// (PROTOCOL.md §4). Major mismatch refuses the connection; minor skew connects.
     /// </summary>
     public readonly struct DawApiVersion : IEquatable<DawApiVersion> {
-        public const string CurrentString = "1.2";
-        public static DawApiVersion Current => new DawApiVersion(1, 2);
+        public const string CurrentString = "1.3";
+        public static DawApiVersion Current => new DawApiVersion(1, 3);
 
         public readonly int Major;
         public readonly int Minor;
@@ -266,5 +271,63 @@ namespace OpenUtau.Core.DawIntegration {
     /// <summary><c>bpm</c> notification payload (v1.1): the DAW project's tempo.</summary>
     public class BpmNotification {
         [JsonPropertyName("bpm")] public double Bpm { get; set; }
+    }
+
+    /// <summary>
+    /// <c>recordStart</c> request payload (v1.3, §6.3): opens a recording session for a
+    /// window on the shared timeline. <see cref="StartMs"/> and <see cref="EndMs"/> are the
+    /// same absolute-millisecond coordinate <see cref="PlayheadNotification.PositionMs"/>
+    /// uses, so the plugin can drop notes the DAW sends from outside the window.
+    /// </summary>
+    public class RecordStartRequest {
+        [JsonPropertyName("trackNo")] public int TrackNo { get; set; }
+        [JsonPropertyName("startMs")] public double StartMs { get; set; }
+        [JsonPropertyName("endMs")] public double EndMs { get; set; }
+    }
+
+    /// <summary><c>recordStart</c> response data (v1.3).</summary>
+    public class RecordStartResponse {
+        [JsonPropertyName("sessionId")] public string SessionId { get; set; } = string.Empty;
+        [JsonPropertyName("apiVersion")] public string ApiVersion { get; set; } = string.Empty;
+    }
+
+    /// <summary>
+    /// <c>recordStop</c> request payload (v1.3, §6.3). <see cref="Commit"/> false discards
+    /// what was recorded — the user cancelled.
+    /// </summary>
+    public class RecordStopRequest {
+        [JsonPropertyName("sessionId")] public string SessionId { get; set; } = string.Empty;
+        [JsonPropertyName("commit")] public bool Commit { get; set; } = true;
+    }
+
+    /// <summary><c>recordStop</c> response data (v1.3): how many notes the plugin sent.</summary>
+    public class RecordStopResponse {
+        [JsonPropertyName("noteCount")] public int NoteCount { get; set; }
+    }
+
+    /// <summary>
+    /// One note of a <c>midiNotes</c> notification (v1.3, §6.3). <see cref="Tone"/> is a MIDI
+    /// note number and maps to <c>UNote.tone</c> unchanged. Times are absolute milliseconds on
+    /// the shared timeline; the receiver converts them to ticks on its own time axis, which
+    /// does not correct for a tempo mismatch (§6.3.1).
+    /// </summary>
+    public class DawNote {
+        [JsonPropertyName("tone")] public int Tone { get; set; }
+        [JsonPropertyName("startMs")] public double StartMs { get; set; }
+        [JsonPropertyName("durationMs")] public double DurationMs { get; set; }
+        /// <summary>0-127, or null when the sender has none and the default should stand.</summary>
+        [JsonPropertyName("velocity")] public int? Velocity { get; set; }
+        /// <summary>Optional: MIDI carries no lyric, so a DAW-side editor sends none.</summary>
+        [JsonPropertyName("lyric")] public string? Lyric { get; set; }
+    }
+
+    /// <summary>
+    /// <c>midiNotes</c> notification payload (v1.3, §6.3): a batch of recorded notes. Batches
+    /// keep a chord from costing a message per voice; a receiver must tolerate any batching,
+    /// including one note per message.
+    /// </summary>
+    public class MidiNotesNotification {
+        [JsonPropertyName("sessionId")] public string SessionId { get; set; } = string.Empty;
+        [JsonPropertyName("notes")] public List<DawNote> Notes { get; set; } = new List<DawNote>();
     }
 }
