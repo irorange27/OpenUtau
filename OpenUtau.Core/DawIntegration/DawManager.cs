@@ -255,6 +255,27 @@ namespace OpenUtau.Core.DawIntegration {
         private readonly SemaphoreSlim syncGate = new SemaphoreSlim(1, 1);
         private readonly object stateLock = new object();
 
+        /// <summary>
+        /// The open MIDI recording session (§6.3), or null when none is open. Guarded by
+        /// <see cref="stateLock"/>. At most one at a time: the protocol refuses a second
+        /// <c>recordStart</c> while one is open, and a session belongs to one connection
+        /// because that is where the notes will arrive from.
+        /// </summary>
+        private MidiRecordSession? midiSession;
+
+        /// <summary>State of the open recording session. See <see cref="midiSession"/>.</summary>
+        private sealed class MidiRecordSession {
+            public Connection Connection = null!;
+            public string SessionId = string.Empty;
+            public int TrackNo;
+            public double StartMs;
+            public double EndMs;
+            /// <summary>Notes accumulated so far, in arrival order. Sorted on apply.</summary>
+            public readonly List<DawNote> Notes = new List<DawNote>();
+            /// <summary>How many notes the plugin says it sent, from the recordStop answer.</summary>
+            public int? ReportedCount;
+        }
+
         /// <summary>Advertised hash → the part that produced it, so a cache miss can be re-extracted.</summary>
         private readonly Dictionary<string, UVoicePart> hashOwners = new Dictionary<string, UVoicePart>();
 
@@ -948,6 +969,14 @@ namespace OpenUtau.Core.DawIntegration {
                         }
                     }
                     break;
+                case DawMessageKind.MidiNotes:
+                    if (payload.HasValue) {
+                        var batch = payload.Value.Deserialize<MidiNotesNotification>(DawJson.Options);
+                        if (batch != null) {
+                            AccumulateMidiNotes(conn, batch);
+                        }
+                    }
+                    break;
                 default:
                     Log.Information($"DAW: ignoring unknown notification '{kind}'.");
                     break;
@@ -999,6 +1028,197 @@ namespace OpenUtau.Core.DawIntegration {
                 return 0;
             }), "bpm check");
         }
+
+        // ---------------------------------------------------------------- MIDI input (§6.3)
+
+        /// <summary>
+        /// Opens a recording session on <paramref name="conn"/> and tells the plugin to start
+        /// sending notes (§6.3). Returns the session id the plugin assigned.
+        /// </summary>
+        /// <param name="windowStartMs">
+        /// The window on the shared timeline to record. Notes the DAW sends from outside it are
+        /// dropped by the receiver as well as by the plugin, since a note the user did not
+        /// record should not be trusted to a peer's good behaviour.
+        /// </param>
+        /// <exception cref="InvalidOperationException">
+        /// A session is already open. The protocol refuses a second <c>recordStart</c>; the
+        /// caller must <see cref="StopMidiRecordingAsync"/> first.
+        /// </exception>
+        public async Task<string> StartMidiRecordingAsync(
+            int trackNo, double windowStartMs, double windowEndMs,
+            CancellationToken cancellation = default) {
+            Connection conn;
+            lock (stateLock) {
+                if (midiSession != null) {
+                    throw new InvalidOperationException("session_already_open");
+                }
+                conn = connections.FirstOrDefault(c => c.Transport != null)
+                    ?? throw new InvalidOperationException("no live DAW connection");
+            }
+            var response = await conn.Transport!.SendRequestAsync<RecordStartResponse>(
+                DawMessageKind.RecordStart,
+                new RecordStartRequest {
+                    TrackNo = trackNo,
+                    StartMs = windowStartMs,
+                    EndMs = windowEndMs,
+                },
+                cancellation: cancellation);
+            lock (stateLock) {
+                // Re-check: another caller may have opened one while this awaited.
+                if (midiSession != null) {
+                    throw new InvalidOperationException("session_already_open");
+                }
+                midiSession = new MidiRecordSession {
+                    Connection = conn,
+                    SessionId = response.SessionId,
+                    TrackNo = trackNo,
+                    StartMs = windowStartMs,
+                    EndMs = windowEndMs,
+                };
+            }
+            Log.Information($"DAW: MIDI recording session '{response.SessionId}' open on track {trackNo}.");
+            return response.SessionId;
+        }
+
+        /// <summary>
+        /// Closes the open session (§6.3) and, when <paramref name="commit"/> is true, applies
+        /// the notes it collected as one undoable edit.
+        /// </summary>
+        /// <returns>The number of notes actually applied, which is not necessarily the number
+        /// the plugin sent: notes outside the window, malformed entries and notes that could
+        /// not be placed are all dropped.</returns>
+        public async Task<int> StopMidiRecordingAsync(
+            bool commit = true, CancellationToken cancellation = default) {
+            MidiRecordSession? session;
+            lock (stateLock) {
+                session = midiSession;
+            }
+            if (session == null) {
+                return 0;
+            }
+            // The session must stay installed until the recordStop round-trip completes.
+            // Clearing it first would drop notes that are already on the wire: the sender's
+            // write returns as soon as the bytes are buffered, so a stop issued right after a
+            // midiNotes races it, and the receiver would see the batch arrive with no session
+            // to attach it to. TCP orders the two messages, and the round-trip below is the
+            // point at which every earlier batch has certainly been processed.
+            try {
+                var transport = session.Connection.Transport;
+                if (transport != null) {
+                    var response = await transport.SendRequestAsync<RecordStopResponse>(
+                        DawMessageKind.RecordStop,
+                        new RecordStopRequest { SessionId = session.SessionId, Commit = commit },
+                        cancellation: cancellation);
+                    session.ReportedCount = response.NoteCount;
+                    if (response.NoteCount != session.Notes.Count) {
+                        // Not fatal, but worth knowing: the two sides disagree about how many
+                        // notes crossed, which usually means one was dropped in flight.
+                        Log.Warning($"DAW: session '{session.SessionId}' sent {response.NoteCount} " +
+                                    $"notes but {session.Notes.Count} arrived.");
+                    }
+                }
+            } catch (Exception e) {
+                Log.Warning(e, $"DAW: stopping session '{session.SessionId}' failed; " +
+                               $"applying the {session.Notes.Count} notes already received.");
+            } finally {
+                // Now the round-trip is done, so no further batch for this session can arrive.
+                lock (stateLock) {
+                    if (ReferenceEquals(midiSession, session)) {
+                        midiSession = null;
+                    }
+                }
+            }
+            if (!commit) {
+                Log.Information($"DAW: session '{session.SessionId}' discarded ({session.Notes.Count} notes).");
+                return 0;
+            }
+            return await ApplyMidiNotesAsync(session);
+        }
+
+        /// <summary>Whether a recording session is open.</summary>
+        public bool IsMidiRecording {
+            get { lock (stateLock) { return midiSession != null; } }
+        }
+
+        /// <summary>
+        /// Collects a <c>midiNotes</c> batch into the open session (§6.3). Notes for an unknown
+        /// or closed session are dropped with a warning rather than treated as a protocol
+        /// error: the session may have closed while the message was in flight.
+        /// </summary>
+        private void AccumulateMidiNotes(Connection conn, MidiNotesNotification batch) {
+            lock (stateLock) {
+                var session = midiSession;
+                if (session == null || session.SessionId != batch.SessionId) {
+                    Log.Warning($"DAW: dropping {batch.Notes.Count} notes for unknown session " +
+                                $"'{batch.SessionId}'.");
+                    return;
+                }
+                if (!ReferenceEquals(session.Connection, conn)) {
+                    // One session belongs to one connection; notes from another are not ours.
+                    Log.Warning($"DAW: dropping notes for session '{batch.SessionId}' " +
+                                $"that arrived on a different connection.");
+                    return;
+                }
+                session.Notes.AddRange(batch.Notes);
+            }
+        }
+
+        /// <summary>
+        /// Applies a finished session's notes to the project as one undoable edit (§6.3.3).
+        /// </summary>
+        private Task<int> ApplyMidiNotesAsync(MidiRecordSession session) {
+            return OnDocumentThreadAsync(() => {
+                var project = ProjectSource();
+                var converted = DawNoteImporter.Convert(
+                    project, session.Notes, DefaultDawLyric, session.StartMs, session.EndMs);
+                if (converted.Count == 0) {
+                    Log.Information($"DAW: session '{session.SessionId}' produced no applicable notes.");
+                    return 0;
+                }
+                if (session.TrackNo < 0 || session.TrackNo >= project.tracks.Count) {
+                    Log.Warning($"DAW: session '{session.SessionId}' targets track " +
+                                $"{session.TrackNo}, which does not exist.");
+                    return 0;
+                }
+                var part = DawNoteImporter.FindTargetPart(project, session.TrackNo, converted);
+                if (part == null) {
+                    // No part covers the recorded window. Create one rather than refusing:
+                    // the user drew notes and expects to see them, and an empty track is the
+                    // common case for a first recording.
+                    part = CreatePartFor(project, session.TrackNo, converted);
+                    DocManager.Inst.ExecuteCmd(new AddPartCommand(project, part));
+                }
+                // One command for the whole batch, so a mistaken recording is one undo away.
+                DocManager.Inst.ExecuteCmd(new AddNoteCommand(part, converted));
+                Log.Information($"DAW: session '{session.SessionId}' applied {converted.Count} " +
+                                $"notes to track {session.TrackNo}.");
+                return converted.Count;
+            });
+        }
+
+        /// <summary>
+        /// Builds a part covering <paramref name="notes"/> on <paramref name="trackNo"/>.
+        /// The part starts at the first note and runs to the last note's end, so an empty
+        /// track gains exactly the recorded material and no more.
+        /// </summary>
+        private static UVoicePart CreatePartFor(UProject project, int trackNo, List<UNote> notes) {
+            int start = notes[0].position;
+            int end = notes.Max(n => n.End);
+            var part = new UVoicePart {
+                trackNo = trackNo,
+                position = start,
+                duration = Math.Max(DawNoteImporter.MinDurationTicks, end - start),
+                name = "Recorded",
+            };
+            return part;
+        }
+
+        /// <summary>
+        /// The lyric given to recorded notes that carry none. MIDI has no lyric field, so this
+        /// is the normal case; the user replaces it in OpenUtau, where the editor is built for
+        /// it (§6.3.2).
+        /// </summary>
+        public const string DefaultDawLyric = "la";
 
         /// <summary>
         /// End of one connection. A close we asked for stays closed; anything else climbs the

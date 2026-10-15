@@ -39,6 +39,45 @@ namespace OpenUtau.Core.DawIntegration {
         /// <summary>What this plugin answers <c>init</c> with. Set before connecting to test §4.</summary>
         public string ApiVersion { get; set; } = DawApiVersion.CurrentString;
 
+        // --- MIDI recording (§6.3) ---
+        /// <summary>The session id handed out by the last <c>recordStart</c>.</summary>
+        public string SessionId { get; private set; } = string.Empty;
+        /// <summary>Whether a recording session is currently open.</summary>
+        public bool SessionOpen { get; private set; }
+        /// <summary>The window the last <c>recordStart</c> asked for.</summary>
+        public (double StartMs, double EndMs) RecordWindow { get; private set; }
+        /// <summary>The track the last <c>recordStart</c> named.</summary>
+        public int RecordTrackNo { get; private set; }
+        /// <summary>The <c>commit</c> flag the last <c>recordStop</c> carried.</summary>
+        public bool LastStopCommitted { get; private set; }
+        /// <summary>How many notes were sent during the current session, for the stop answer.</summary>
+        public int NotesSentThisSession { get; private set; }
+        private int sessionCounter;
+
+        /// <summary>
+        /// Sends a <c>midiNotes</c> batch for the open session (§6.3). Fails loudly rather than
+        /// sending notes for a session that was never opened, which is the mistake the test is
+        /// usually trying to rule out.
+        /// </summary>
+        public Task SendMidiNotesAsync(IEnumerable<DawNote> notes) {
+            if (!SessionOpen) {
+                throw new InvalidOperationException("No recording session is open.");
+            }
+            var list = notes.ToList();
+            NotesSentThisSession += list.Count;
+            return Transport!.SendNotificationAsync(DawMessageKind.MidiNotes, new MidiNotesNotification {
+                SessionId = SessionId,
+                Notes = list,
+            });
+        }
+
+        /// <summary>Sends a <c>midiNotes</c> batch under an arbitrary session id.</summary>
+        public Task SendMidiNotesForSessionAsync(string sessionId, IEnumerable<DawNote> notes) =>
+            Transport!.SendNotificationAsync(DawMessageKind.MidiNotes, new MidiNotesNotification {
+                SessionId = sessionId,
+                Notes = notes.ToList(),
+            });
+
         public string Name { get; }
         public int Port { get; }
         public string DiscoveryPath { get; }
@@ -148,6 +187,31 @@ namespace OpenUtau.Core.DawIntegration {
                             .ToList(),
                     }));
                     break;
+                case DawMessageKind.RecordStart: {
+                    // §6.3: hand back a session id the client must echo on every midiNotes.
+                    var start = request.ReadPayload<RecordStartRequest>();
+                    RecordWindow = (start.StartMs, start.EndMs);
+                    RecordTrackNo = start.TrackNo;
+                    SessionId = $"r-{++sessionCounter}";
+                    SessionOpen = true;
+                    NotesSentThisSession = 0;
+                    Received.Enqueue(request.Kind);
+                    await request.RespondAsync(DawResult.Ok(new RecordStartResponse {
+                        SessionId = SessionId,
+                        ApiVersion = DawApiVersion.CurrentString,
+                    }));
+                    break;
+                }
+                case DawMessageKind.RecordStop: {
+                    var stop = request.ReadPayload<RecordStopRequest>();
+                    SessionOpen = false;
+                    LastStopCommitted = stop.Commit;
+                    Received.Enqueue(request.Kind);
+                    await request.RespondAsync(DawResult.Ok(new RecordStopResponse {
+                        NoteCount = NotesSentThisSession,
+                    }));
+                    break;
+                }
                 default:
                     Received.Enqueue(request.Kind);
                     await request.RespondAsync(DawResult.Fail($"Unsupported request '{request.Kind}'."));

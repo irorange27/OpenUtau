@@ -409,6 +409,14 @@ moves that decision to the user, who knows whether they are editing or just list
   session, so OpenUtau can reconcile against what it actually applied.
 - `recordStop` for an already-closed session is not an error; it returns
   `{ "noteCount": 0 }`.
+- **The round-trip is the synchronization point, and receivers must treat it as one.**
+  A sender's write returns as soon as its bytes are buffered, so a `recordStop` issued
+  immediately after a `midiNotes` can reach the peer while that batch is still being
+  processed. A receiver that clears its session before the round-trip completes will drop
+  those notes. Both ends must therefore keep the session installed until the response
+  arrives: TCP orders the two messages, so the response is proof that every earlier batch
+  has been handled. The reference implementation got this wrong first and dropped the
+  final batch on every stop.
 
 #### 6.3.1 Timing, and the tempo caveat
 
